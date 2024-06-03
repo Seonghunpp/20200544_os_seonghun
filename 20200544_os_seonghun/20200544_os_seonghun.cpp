@@ -1,95 +1,200 @@
 ﻿#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <unordered_map>
+#include <atomic>
+#include <functional>
+#include <locale>
+#include <codecvt>
 
-using namespace std;
+// 전역 변수 및 동기화 객체
+std::mutex mtx;
+std::condition_variable cv;
+std::atomic<bool> done(false);
+std::queue<std::string> commandQueue;
+std::vector<std::thread> backgroundThreads;
+std::unordered_map<std::string, std::function<void(std::vector<std::string>)>> commandMap;
 
-// 프로세스를 나타내는 구조체
-struct Process {
-    int id;
-    Process* next;
+// 유틸리티 함수
+int gcd(int a, int b) {
+    while (b != 0) {
+        int t = b;
+        b = a % t;
+        a = t;
+    }
+    return a;
+}
 
-    Process(int _id) : id(_id), next(nullptr) {}
-};
+int prime_count(int n) {
+    std::vector<bool> is_prime(n + 1, true);
+    int count = 0;
+    for (int i = 2; i <= n; ++i) {
+        if (is_prime[i]) {
+            ++count;
+            for (int j = i * 2; j <= n; j += i) {
+                is_prime[j] = false;
+            }
+        }
+    }
+    return count;
+}
 
-// 스택 노드를 나타내는 클래스
-class StackNode {
-public:
-    Process* processList; // 프로세스 리스트를 가리키는 포인터
-    StackNode* next;      // 다음 스택 노드를 가리키는 포인터
+int sum_mod(int n) {
+    long long sum = 0;
+    for (int i = 1; i <= n; ++i) {
+        sum = (sum + i) % 1000000;
+    }
+    return static_cast<int>(sum);
+}
 
-    // 생성자: 초기화
-    StackNode(Process* process) : processList(process), next(nullptr) {}
-};
+// 프로세스 함수
+void echo(const std::vector<std::string>& args) {
+    for (const auto& arg : args) {
+        std::cout << arg << " ";
+    }
+    std::cout << std::endl;
+}
 
-// 큐를 나타내는 클래스
-class DynamicQueue {
-public:
-    StackNode* top;    // 스택의 맨 위(top) 노드를 가리키는 포인터
-    StackNode* bottom; // 스택의 맨 아래(bottom) 노드를 가리키는 포인터
+void dummy(const std::vector<std::string>& args) {
+    // Do nothing
+}
 
-    // 생성자: 초기화
-    DynamicQueue() : top(nullptr), bottom(nullptr) {
-        // 초기 상태일 때 top과 bottom이 같은 노드를 가리키도록 설정
-        StackNode* initialNode = new StackNode(nullptr);
-        top = initialNode;
-        bottom = initialNode;
+void gcd_command(const std::vector<std::string>& args) {
+    if (args.size() < 2) return;
+    int a = std::stoi(args[0]);
+    int b = std::stoi(args[1]);
+    std::cout << "GCD: " << gcd(a, b) << std::endl;
+}
+
+void prime(const std::vector<std::string>& args) {
+    if (args.empty()) return;
+    int x = std::stoi(args[0]);
+    std::cout << "Prime count: " << prime_count(x) << std::endl;
+}
+
+void sum(const std::vector<std::string>& args) {
+    if (args.empty()) return;
+    int x = std::stoi(args[0]);
+    std::cout << "Sum mod 1000000: " << sum_mod(x) << std::endl;
+}
+
+void executeCommand(const std::string& command, bool isBackground);
+
+void periodicTask(const std::string& command, int period, int duration) {
+    auto start = std::chrono::steady_clock::now();
+    while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() < duration) {
+        executeCommand(command, true);
+        std::this_thread::sleep_for(std::chrono::seconds(period));
+    }
+}
+void executeCommand(const std::string& command, bool isBackground) {
+    std::istringstream iss(command);
+    std::vector<std::string> args;
+    std::string arg;
+    while (iss >> arg) {
+        args.push_back(arg);
     }
 
-    // 백그라운드 프로세스를 큐에 추가하는 함수
-    void enqueueBackground(Process* process) {
-        if (bottom->processList == nullptr) {
-            bottom->processList = process;
+    if (args.empty()) return;
+
+    std::string cmd = args[0];
+    args.erase(args.begin());
+
+    // 옵션 파싱
+    int n = 1; // 기본 실행 횟수
+    int duration = 300; // 기본 실행 시간 (5분)
+    int period = 0; // 반복 주기
+
+    auto it = args.begin();
+    while (it != args.end()) {
+        if (*it == "-n" && (it + 1) != args.end()) {
+            n = std::stoi(*(it + 1));
+            it = args.erase(it, it + 2);
+        }
+        else if (*it == "-d" && (it + 1) != args.end()) {
+            duration = std::stoi(*(it + 1));
+            it = args.erase(it, it + 2);
+        }
+        else if (*it == "-p" && (it + 1) != args.end()) {
+            period = std::stoi(*(it + 1));
+            it = args.erase(it, it + 2);
         }
         else {
-            Process* currentProcess = bottom->processList;
-            while (currentProcess->next != nullptr) {
-                currentProcess = currentProcess->next;
-            }
-            currentProcess->next = process;
+            ++it;
         }
     }
 
-    // 포어그라운드 프로세스를 큐에 추가하는 함수
-    void enqueueForeground(Process* process) {
-        if (top->processList == nullptr) {
-            top->processList = process;
+    // 명령어를 실행할 함수와 인자들을 설정
+    auto executeFunc = [cmd, args, duration, period, n]() {
+        if (commandMap.find(cmd) != commandMap.end()) {
+            for (int i = 0; i < n; ++i) {
+                if (period > 0) {
+                    periodicTask(cmd, period, duration);
+                }
+                else {
+                    commandMap[cmd](args);
+                }
+            }
         }
         else {
-            Process* currentProcess = top->processList;
-            while (currentProcess->next != nullptr) {
-                currentProcess = currentProcess->next;
-            }
-            currentProcess->next = process;
+            std::cout << "Unknown command: " << cmd << std::endl;
+        }
+    };
+
+    // 명령어를 실행할 스레드들 생성
+    std::vector<std::thread> threads;
+    for (int i = 0; i < n; ++i) {
+        threads.push_back(std::thread(executeFunc));
+    }
+
+    // 생성된 스레드들 조인
+    for (auto& thread : threads) {
+        if (thread.joinable()) {
+            thread.join();
         }
     }
-};
+}
+
+
+
+void shell() {
+    std::wifstream file("commands.txt", std::ios::in | std::ios::binary);
+    file.imbue(std::locale(file.getloc(), new std::codecvt_utf8<wchar_t, 0x10ffff, std::consume_header>));
+    std::wstring line;
+    while (std::getline(file, line)) {
+        std::this_thread::sleep_for(std::chrono::seconds(5)); // 5초마다 1줄씩 실행
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            std::wcout << L"prompt> " << line << std::endl;
+            std::cout << std::endl;
+            commandQueue.push(std::string(line.begin(), line.end()));
+            commandQueue.push(""); // 한 줄씩 띄우기 위해 빈 문자열 추가
+        }
+        cv.notify_one();
+    }
+}
 
 int main() {
-    // 초기화된 큐 생성
-    DynamicQueue queue;
+    // 명령어 맵 설정
+    commandMap["echo"] = echo;
+    commandMap["dummy"] = dummy;
+    commandMap["gcd"] = gcd_command;
+    commandMap["prime"] = prime;
+    commandMap["sum"] = sum;
 
-    // 백그라운드 프로세스 추가
-    Process* backgroundProcess1 = new Process();
-    backgroundProcess1->id = 1;
-    queue.enqueueBackground(backgroundProcess1);
+    // 셸 시작
+    std::thread shellThread(shell);
 
-    Process* backgroundProcess2 = new Process();
-    backgroundProcess2->id = 2;
-    queue.enqueueBackground(backgroundProcess2);
-
-    // 포어그라운드 프로세스 추가
-    Process* foregroundProcess1 = new Process();
-    foregroundProcess1->id = 3;
-    queue.enqueueForeground(foregroundProcess1);
-
-    Process* foregroundProcess2 = new Process();
-    foregroundProcess2->id = 4;
-    queue.enqueueForeground(foregroundProcess2);
-
-    // 메모리 해제
-    delete backgroundProcess1;
-    delete backgroundProcess2;
-    delete foregroundProcess1;
-    delete foregroundProcess2;
+    // 셸 쓰레드 조인
+    if (shellThread.joinable()) {
+        shellThread.join();
+    }
 
     return 0;
 }
